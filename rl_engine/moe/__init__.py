@@ -2,6 +2,10 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """P5 start kit: MXFP4 Routed Expert + LoRA + Shared Expert contracts (issue #8)."""
 
+from rl_engine.moe.backends.mxfp8_act_quant import (
+    CudaMXFP8ActQuantProvider,
+    TritonMXFP8ActQuantProvider,
+)
 from rl_engine.moe.contract import (
     GATE_CLAMP_MAX,
     ORACLE_PROFILE,
@@ -23,6 +27,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "UP_CLAMP_MAX",
     "UP_CLAMP_MIN",
+    "CudaMXFP8ActQuantProvider",
     "ExpertBatch",
     "ExpertProvider",
     "ExpertTrace",
@@ -32,6 +37,7 @@ __all__ = [
     "ReferenceProvider",
     "SharedBatch",
     "StubProvider",
+    "TritonMXFP8ActQuantProvider",
     "first_divergence",
     "mx_dequantize",
     "mx_quantize",
