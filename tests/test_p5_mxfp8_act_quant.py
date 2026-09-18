@@ -317,3 +317,48 @@ def test_cuda_kernel_is_fast_math_immune(tmp_path):
         assert int(flag.item()) == 0
         assert torch.equal(scales, ref.scales), "fast-math build changed E8M0 scale bytes"
         assert torch.equal(codes, ref.codes), "fast-math build changed E4M3 element bytes"
+
+
+def _wide_range_cuda(rows: int, cols: int, seed: int = 11) -> torch.Tensor:
+    """GPU-generated variant of _wide_range for shapes too large to build on the CPU."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    mant = torch.randn(rows, cols, device=DEV, generator=g)
+    exp = torch.randint(-60, 60, (rows, cols), device=DEV, generator=g).float()
+    return mant * torch.exp2(exp)
+
+
+@pytest.mark.parametrize("name,fwd", FWD, ids=BACKEND_IDS)
+@pytest.mark.parametrize("shape", [(4096, 7168), (16384, 7168)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_forward_bitwise_at_production_shapes(name, fwd, shape, dtype):
+    """The benchmark shapes (DeepSeek-V3 hidden size), asserted byte-equal, not just timed.
+
+    Random exponents over 2**+-60 so every tile takes a different scale path.
+    """
+    x = _wide_range_cuda(*shape).to(dtype)
+    _assert_byte_equal(fwd(x), mx_quantize(x, "e4m3"), f"{name} {shape} {dtype}")
+
+
+def test_triton_offsets_do_not_wrap_past_int32():
+    """2**31 elements: int32 element offsets would wrap negative and read before the buffer.
+
+    The oracle cannot be run on a tensor this size (it materializes FP32 copies), so the
+    check leans on the row-local contract: rows at the far end of the tensor must quantize
+    to exactly what they quantize to on their own.
+    """
+    if "triton" not in BACKEND_IDS:
+        pytest.skip("triton backend unavailable")
+    rows, cols = 2**31 // 8192, 8192  # 2**31 bf16 elements: 4 GiB in, 2 GiB + 64 MiB out
+    need = rows * cols * (2 + 1) + rows * (cols // MX_BLOCK) + (1 << 30)
+    free, _ = torch.cuda.mem_get_info()
+    if free < need:
+        pytest.skip(f"needs ~{need / 2**30:.1f} GiB free on the device, have {free / 2**30:.1f}")
+    fwd = dict((n, f) for n, f, _ in BACKENDS)["triton"]
+    x = (torch.randn(rows, cols, device=DEV) * 3.0).to(torch.bfloat16)
+    full = fwd(x)
+    for lo in (0, rows // 2, rows - 64):
+        part = mx_quantize(x[lo : lo + 64], "e4m3")
+        assert torch.equal(full.codes[lo : lo + 64], part.codes), f"rows {lo}..{lo + 64}"
+        assert torch.equal(full.scales[lo : lo + 64], part.scales), f"rows {lo}..{lo + 64}"
+    del x, full
+    torch.cuda.empty_cache()
