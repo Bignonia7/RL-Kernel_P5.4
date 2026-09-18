@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""P5-1 ``mxfp8_act_quant``: torch-native vs Triton vs CUDA vs torchao (P5-1 spec).
+"""P5-1 ``mxfp8_act_quant``: torch-native vs Triton vs CUDA vs torchao.
 
 Baselines
 ---------
@@ -132,10 +132,6 @@ def _fmt(ms: float) -> str:
     return "n/a" if ms != ms else f"{ms:.4f}"
 
 
-def _speedup(baseline: float, ours: float) -> str:
-    return "n/a" if baseline != baseline else f"{baseline / ours:.2f}x"
-
-
 def build_candidates(check_finite: bool):
     """(label, note, callable) triples, ordered slowest-family first."""
     candidates = [("torch-native", "P5 oracle", lambda t: mx_quantize(t, "e4m3"))]
@@ -192,12 +188,15 @@ def verify_baselines_are_byte_equal(dtype: torch.dtype) -> None:
     """The comparison is only meaningful if every MX path emits the same bytes."""
     x = (torch.randn(64, 256, device=DEV) * 3.0).to(dtype)
     ref = mx_quantize(x, "e4m3")
+
+    def same(codes: torch.Tensor, scales: torch.Tensor) -> bool:
+        return torch.equal(codes.view(torch.uint8), ref.codes) and torch.equal(
+            scales.view(torch.uint8).reshape(ref.scales.shape), ref.scales
+        )
+
     if _HAS_TORCHAO:
         scales, codes = _torchao_to_mx(x, torch.float8_e4m3fn, MX_BLOCK)
-        same = torch.equal(
-            scales.view(torch.uint8).reshape(ref.scales.shape), ref.scales
-        ) and torch.equal(codes.view(torch.uint8), ref.codes)
-        print(f"torchao to_mx(FLOOR)            byte-identical to the P5 oracle: {same}")
+        print(f"torchao to_mx(FLOOR)       byte-identical to the P5 oracle: {same(codes, scales)}")
     if _HAS_TRITON_KERNELS:
         codes, scales = downcast_to_mxfp(
             x,
@@ -205,15 +204,12 @@ def verify_baselines_are_byte_equal(dtype: torch.dtype) -> None:
             axis=-1,
             DEQUANT_SCALE_ROUNDING_MODE=DequantScaleRoundingMode.ROUND_DOWN,
         )
-        same = torch.equal(
-            scales.view(torch.uint8).reshape(ref.scales.shape), ref.scales
-        ) and torch.equal(codes.view(torch.uint8), ref.codes)
-        print(f"triton_kernels(ROUND_DOWN)      byte-identical to the P5 oracle: {same}")
+        print(f"triton_kernels(ROUND_DOWN) byte-identical to the P5 oracle: {same(codes, scales)}")
     if _HAS_TRITON:
         got = mxfp8_act_quant_fwd_triton(x)
-        assert torch.equal(got.codes, ref.codes) and torch.equal(got.scales, ref.scales)
+        assert same(got.codes, got.scales)
     got = mxfp8_act_quant_fwd_cuda(x)
-    assert torch.equal(got.codes, ref.codes) and torch.equal(got.scales, ref.scales)
+    assert same(got.codes, got.scales)
 
 
 def run(dtype: torch.dtype, iters: int, check_finite: bool) -> None:

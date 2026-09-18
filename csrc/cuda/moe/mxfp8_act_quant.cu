@@ -37,6 +37,8 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <type_traits>
+
 // fp16 / bf16 / fp32 only: the vectorized loader has no fp64 specialization and
 // the P5 contract never feeds fp64 activations.
 #define DISPATCH_ACT_QUANT_TYPES(TYPE, NAME, ...)              \
@@ -57,61 +59,41 @@ constexpr float E4M3_MAX = 448.0f;
 // exponent field alone.
 constexpr unsigned int BITS_2POW_M127 = 0x00400000u;
 
-__device__ __forceinline__ float bf16_bits_to_float(unsigned short bits) {
-  return __uint_as_float(static_cast<unsigned int>(bits) << 16);
+template <typename T>
+__device__ __forceinline__ float bits16_to_float(unsigned short bits);
+
+template <>
+__device__ __forceinline__ float bits16_to_float<at::BFloat16>(unsigned short bits) {
+  return __uint_as_float(static_cast<unsigned int>(bits) << 16);  // exact
 }
 
+template <>
+__device__ __forceinline__ float bits16_to_float<at::Half>(unsigned short bits) {
+  return __half2float(__ushort_as_half(bits));
+}
+
+// VEC == 1 is the unaligned scalar fallback; otherwise one 16-byte load
+// (4 floats or 8 bf16/half).
 template <typename scalar_t, int VEC>
-__device__ __forceinline__ void load_vec(const scalar_t* __restrict__ p, float* out);
-
-template <>
-__device__ __forceinline__ void load_vec<float, 1>(const float* __restrict__ p, float* out) {
-  out[0] = p[0];
-}
-
-// 16-byte chunk loaders (4 floats / 8 bf16 / 8 half).
-template <>
-__device__ __forceinline__ void load_vec<float, 4>(const float* __restrict__ p, float* out) {
-  const float4 v = *reinterpret_cast<const float4*>(p);
-  out[0] = v.x;
-  out[1] = v.y;
-  out[2] = v.z;
-  out[3] = v.w;
-}
-
-template <>
-__device__ __forceinline__ void load_vec<at::BFloat16, 1>(
-    const at::BFloat16* __restrict__ p, float* out) {
-  out[0] = bf16_bits_to_float(*reinterpret_cast<const unsigned short*>(p));
-}
-
-template <>
-__device__ __forceinline__ void load_vec<at::BFloat16, 8>(
-    const at::BFloat16* __restrict__ p, float* out) {
-  const uint4 v = *reinterpret_cast<const uint4*>(p);
-  const unsigned int words[4] = {v.x, v.y, v.z, v.w};
+__device__ __forceinline__ void load_vec(const scalar_t* __restrict__ p, float* out) {
+  if constexpr (VEC == 1) {
+    out[0] = static_cast<float>(p[0]);
+  } else if constexpr (std::is_same_v<scalar_t, float>) {
+    static_assert(VEC == 4, "16-byte chunk");
+    const float4 v = *reinterpret_cast<const float4*>(p);
+    out[0] = v.x;
+    out[1] = v.y;
+    out[2] = v.z;
+    out[3] = v.w;
+  } else {
+    static_assert(VEC == 8, "16-byte chunk");
+    const uint4 v = *reinterpret_cast<const uint4*>(p);
+    const unsigned int words[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    out[2 * i] = bf16_bits_to_float(static_cast<unsigned short>(words[i] & 0xFFFFu));
-    out[2 * i + 1] = bf16_bits_to_float(static_cast<unsigned short>(words[i] >> 16));
-  }
-}
-
-template <>
-__device__ __forceinline__ void load_vec<at::Half, 1>(
-    const at::Half* __restrict__ p, float* out) {
-  out[0] = __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(p)));
-}
-
-template <>
-__device__ __forceinline__ void load_vec<at::Half, 8>(
-    const at::Half* __restrict__ p, float* out) {
-  const uint4 v = *reinterpret_cast<const uint4*>(p);
-  const unsigned int words[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    out[2 * i] = __half2float(__ushort_as_half(static_cast<unsigned short>(words[i] & 0xFFFFu)));
-    out[2 * i + 1] = __half2float(__ushort_as_half(static_cast<unsigned short>(words[i] >> 16)));
+    for (int i = 0; i < 4; ++i) {
+      out[2 * i] = bits16_to_float<scalar_t>(static_cast<unsigned short>(words[i] & 0xFFFFu));
+      out[2 * i + 1] = bits16_to_float<scalar_t>(static_cast<unsigned short>(words[i] >> 16));
+    }
   }
 }
 
@@ -202,12 +184,9 @@ __global__ void mxfp8_act_quant_forward_kernel(
   }
 
   unsigned int amax_bits = 0u;
-  bool bad = false;
 #pragma unroll
   for (int i = 0; i < VEC; ++i) {
-    const unsigned int a = abs_bits(v[i]);
-    bad = bad || is_nonfinite_bits(a);
-    amax_bits = max(amax_bits, a);
+    amax_bits = max(amax_bits, abs_bits(v[i]));
   }
 
   // Every lane of the group ends up with the block amax; the whole warp takes
@@ -220,7 +199,9 @@ __global__ void mxfp8_act_quant_forward_kernel(
   if (!active) {
     return;
   }
-  if (bad) {
+  // inf/NaN patterns are >= 0x7F800000, so the block's largest |x| pattern
+  // says whether any element is non-finite.
+  if (is_nonfinite_bits(amax_bits)) {
     atomicOr(nonfinite_flag, 1);
   }
 

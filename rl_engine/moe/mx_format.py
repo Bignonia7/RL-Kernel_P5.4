@@ -71,29 +71,6 @@ class MXTensor:
         )
 
 
-ACT_QUANT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-
-
-def validate_act_quant_input(x: torch.Tensor, backend: str) -> torch.Tensor:
-    """Shape/dtype/device gate shared by the P5-1 kernel backends; returns ``x`` contiguous."""
-    if x.dtype not in ACT_QUANT_DTYPES:
-        raise TypeError(f"x must have dtype fp16, bf16, or fp32, got {x.dtype}.")
-    if not x.is_cuda:
-        raise ValueError(f"{backend} mxfp8_act_quant requires a CUDA tensor.")
-    if x.ndim < 1 or x.shape[-1] % MX_BLOCK != 0:
-        raise ValueError(f"last dim {tuple(x.shape)} not divisible by MX block {MX_BLOCK}.")
-    return x.contiguous()
-
-
-def validate_ste_grad(dy: torch.Tensor, backend: str) -> torch.Tensor:
-    """STE backward gate: any floating dtype (P5-1 spec), CUDA; returns ``dy`` contiguous."""
-    if not dy.is_floating_point():
-        raise TypeError(f"dy must be a floating-point tensor, got {dy.dtype}.")
-    if not dy.is_cuda:
-        raise ValueError(f"{backend} mxfp8_act_quant backward requires a CUDA tensor.")
-    return dy.contiguous()
-
-
 def _check_finite(x: torch.Tensor, what: str) -> None:
     if not torch.isfinite(x).all():
         raise ValueError(f"non-finite values in {what}; P5 quantization is fail-closed")

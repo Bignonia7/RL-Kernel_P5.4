@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""P5-1 (P5-1) providers: MXFP8 activation quantization backends.
+"""P5-1 providers: MXFP8 activation quantization backends.
 
 Each provider subclasses :class:`~rl_engine.moe.provider.ReferenceProvider` and
 overrides only the operators its backend delivers, per the start-kit protocol
@@ -15,16 +15,16 @@ numeric profile instead of registering a relaxed one:
     python scripts/check_p5.py --provider \
         rl_engine.moe.backends.mxfp8_act_quant:CudaMXFP8ActQuantProvider --device cuda
 
-Fail-closed: a CPU tensor or a non-finite input raises instead of silently
-falling back to the oracle. P5-1 spec s4 makes the non-finite raise part of the
-contract, so the providers always run the kernels' read-back (one device sync
-per call); the kernels' ``check_finite=False`` exists for throughput
-measurement only and is deliberately not reachable from a provider.
+Fail-closed: the backend is resolved in ``__init__`` and raises
+``NotImplementedError`` when unavailable (what ``check_p5.py`` renders as a
+FAIL row), a CPU tensor or a non-finite input raises instead of silently
+falling back to the oracle, and the non-finite read-back is always on — the
+P5-1 spec makes the raise part of the contract.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -32,12 +32,20 @@ from rl_engine.moe.mx_format import MXTensor
 from rl_engine.moe.provider import ReferenceProvider
 
 
-class _ActQuantProviderBase(ReferenceProvider):
-    """Shared plumbing for the P5-1 kernel providers."""
+class _MXFP8ActQuantProvider(ReferenceProvider):
+    """Shared plumbing: the subclass supplies ``_resolve()`` -> (fwd, bwd, linkage)."""
 
-    backend = "unset"
+    backend: str
 
-    def _ops(self) -> Any:
+    def __init__(self) -> None:
+        try:
+            self._fwd, self._bwd, self._linkage = self._resolve()
+        except (ImportError, RuntimeError) as exc:
+            raise NotImplementedError(
+                f"{self.name} backend unavailable (fail-closed, no oracle fallback): {exc}"
+            ) from exc
+
+    def _resolve(self) -> tuple[Callable[..., MXTensor], Callable[..., torch.Tensor], str]:
         raise NotImplementedError
 
     def capabilities(self) -> dict[str, Any]:
@@ -54,53 +62,37 @@ class _ActQuantProviderBase(ReferenceProvider):
         return {
             **super().provenance(),
             "operators_overridden": ["mxfp8_act_quant_fwd", "mxfp8_act_quant_bwd"],
-            "linkage": self._linkage(),
+            "linkage": self._linkage,
             "device_name": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
         }
 
-    def _linkage(self) -> str:
-        return "python"
-
     def mxfp8_act_quant_fwd(self, x: torch.Tensor) -> MXTensor:
-        return self._ops().fwd(x)
+        return self._fwd(x)
 
     def mxfp8_act_quant_bwd(self, dy: torch.Tensor) -> torch.Tensor:
-        return self._ops().bwd(dy)
+        return self._bwd(dy)
 
 
-class _Ops:
-    def __init__(self, fwd, bwd):
-        self.fwd = fwd
-        self.bwd = bwd
-
-
-class TritonMXFP8ActQuantProvider(_ActQuantProviderBase):
+class TritonMXFP8ActQuantProvider(_MXFP8ActQuantProvider):
     """Triton MXFP8 activation quantization; every other operator is the oracle."""
 
     name = "mxfp8-act-quant-triton"
     backend = "triton"
 
-    def _ops(self) -> _Ops:
+    def _resolve(self):
         from rl_engine.kernels.ops.triton import moe
 
-        return _Ops(moe.mxfp8_act_quant_fwd_triton, moe.mxfp8_act_quant_bwd_triton)
-
-    def _linkage(self) -> str:
-        return "triton-jit"
+        return moe.mxfp8_act_quant_fwd_triton, moe.mxfp8_act_quant_bwd_triton, "triton-jit"
 
 
-class CudaMXFP8ActQuantProvider(_ActQuantProviderBase):
+class CudaMXFP8ActQuantProvider(_MXFP8ActQuantProvider):
     """CUDA MXFP8 activation quantization; every other operator is the oracle."""
 
     name = "mxfp8-act-quant-cuda"
     backend = "cuda"
 
-    def _ops(self) -> _Ops:
+    def _resolve(self):
         from rl_engine.kernels.ops.cuda import moe
 
-        return _Ops(moe.mxfp8_act_quant_fwd_cuda, moe.mxfp8_act_quant_bwd_cuda)
-
-    def _linkage(self) -> str:
-        from rl_engine.kernels.ops.cuda.moe import backend_name
-
-        return backend_name()  # "aot" (rl_engine._C) or "jit"
+        moe.mxfp8_act_quant.backend()  # AOT symbols or the JIT build, or raise now
+        return moe.mxfp8_act_quant_fwd_cuda, moe.mxfp8_act_quant_bwd_cuda, moe.backend_name()

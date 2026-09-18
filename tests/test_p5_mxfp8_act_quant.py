@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Bit-wise alignment tests for P5-1 ``mxfp8_act_quant`` (P5-1 spec).
+"""Bit-wise alignment tests for P5-1 ``mxfp8_act_quant``.
 
 Both backends (CUDA and Triton) must reproduce the start-kit oracle
 (``rl_engine.moe.mx_format.mx_quantize(x, "e4m3")``) byte for byte — not
@@ -20,10 +20,8 @@ from rl_engine.moe.contract import tensor_sha256
 from rl_engine.moe.mx_format import MX_BLOCK, mx_quantize
 from rl_engine.moe.oracle import mxfp8_act_quant_bwd, mxfp8_act_quant_fwd
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
-    reason="mxfp8_act_quant needs an E4M3-capable GPU (SM89+)",
-)
+_GPU_OK = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
+pytestmark = pytest.mark.skipif(not _GPU_OK, reason="mxfp8_act_quant needs an E4M3 GPU (SM89+)")
 
 DEV = "cuda"
 
@@ -43,18 +41,18 @@ def _backends():
 
     # The CUDA backend needs either the AOT rl_engine._C symbols or a working
     # JIT toolchain (nvcc + ninja); without both it is skipped, not failed.
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9):
+    cuda_error = None
+    if _GPU_OK:
         try:
             mxfp8_act_quant_fwd_cuda(torch.zeros(1, MX_BLOCK, device=DEV, dtype=torch.bfloat16))
         except RuntimeError as exc:
-            _CUDA_BACKEND_ERROR.append(str(exc).splitlines()[0])
+            cuda_error = str(exc).splitlines()[0]
         else:
             backends.append(("cuda", mxfp8_act_quant_fwd_cuda, mxfp8_act_quant_bwd_cuda))
-    return backends
+    return backends, cuda_error
 
 
-_CUDA_BACKEND_ERROR: list[str] = []
-BACKENDS = _backends()
+BACKENDS, _CUDA_BACKEND_ERROR = _backends()
 BACKEND_IDS = [name for name, _, _ in BACKENDS]
 _HAS_CUDA_BACKEND = "cuda" in BACKEND_IDS
 FWD = [(name, fwd) for name, fwd, _ in BACKENDS]
@@ -68,11 +66,11 @@ def _assert_byte_equal(got, want, what: str) -> None:
     assert torch.equal(got.codes, want.codes), f"{what}: E4M3 element bytes differ"
 
 
-def _wide_range(rows: int, cols: int) -> torch.Tensor:
+def _wide_range(rows: int, cols: int, device: str = "cpu", seed: int = 7) -> torch.Tensor:
     """Random values spanning ~2**+-60 so scale selection is exercised hard."""
-    g = torch.Generator(device="cpu").manual_seed(7)
-    mant = torch.randn(rows, cols, generator=g)
-    exp = torch.randint(-60, 60, (rows, cols), generator=g).float()
+    g = torch.Generator(device=device).manual_seed(seed)
+    mant = torch.randn(rows, cols, device=device, generator=g)
+    exp = torch.randint(-60, 60, (rows, cols), device=device, generator=g).float()
     return (mant * torch.exp2(exp)).to(DEV)
 
 
@@ -286,7 +284,7 @@ def test_provider_pipeline_is_byte_equal_to_oracle(provider_cls):
         assert tensor_sha256(grads_cand[key]) == tensor_sha256(grad), f"grad.{key}"
 
 
-def test_cuda_kernel_is_fast_math_immune(tmp_path):
+def test_cuda_kernel_is_fast_math_immune():
     """A --use_fast_math build must emit the same bytes as the oracle.
 
     nvcc turns fmaxf/fabsf/__fdiv_rn into .ftz forms under fast-math; the
@@ -299,11 +297,12 @@ def test_cuda_kernel_is_fast_math_immune(tmp_path):
 
     from rl_engine.kernels.ops.cuda.moe import mxfp8_act_quant as wrapper
 
+    # No build_directory: torch caches the build by name and only recompiles
+    # when the source or flags change, instead of ~50 s of nvcc per session.
     module = load(
         name="rl_engine_p5_mxfp8_act_quant_fastmath",
         sources=[str(wrapper._CU_SOURCE)],
         extra_cuda_cflags=["-O3", "--use_fast_math", "-DRL_KERNEL_P5_STANDALONE"],
-        build_directory=str(tmp_path),
         verbose=False,
     )
     cases = [
@@ -319,14 +318,6 @@ def test_cuda_kernel_is_fast_math_immune(tmp_path):
         assert torch.equal(codes, ref.codes), "fast-math build changed E4M3 element bytes"
 
 
-def _wide_range_cuda(rows: int, cols: int, seed: int = 11) -> torch.Tensor:
-    """GPU-generated variant of _wide_range for shapes too large to build on the CPU."""
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    mant = torch.randn(rows, cols, device=DEV, generator=g)
-    exp = torch.randint(-60, 60, (rows, cols), device=DEV, generator=g).float()
-    return mant * torch.exp2(exp)
-
-
 @pytest.mark.parametrize("name,fwd", FWD, ids=BACKEND_IDS)
 @pytest.mark.parametrize("shape", [(4096, 7168), (16384, 7168)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -335,7 +326,7 @@ def test_forward_bitwise_at_production_shapes(name, fwd, shape, dtype):
 
     Random exponents over 2**+-60 so every tile takes a different scale path.
     """
-    x = _wide_range_cuda(*shape).to(dtype)
+    x = _wide_range(*shape, device=DEV, seed=11).to(dtype)
     _assert_byte_equal(fwd(x), mx_quantize(x, "e4m3"), f"{name} {shape} {dtype}")
 
 
@@ -353,7 +344,7 @@ def test_triton_offsets_do_not_wrap_past_int32():
     free, _ = torch.cuda.mem_get_info()
     if free < need:
         pytest.skip(f"needs ~{need / 2**30:.1f} GiB free on the device, have {free / 2**30:.1f}")
-    fwd = dict((n, f) for n, f, _ in BACKENDS)["triton"]
+    fwd = dict(FWD)["triton"]
     x = (torch.randn(rows, cols, device=DEV) * 3.0).to(torch.bfloat16)
     full = fwd(x)
     for lo in (0, rows // 2, rows - 64):

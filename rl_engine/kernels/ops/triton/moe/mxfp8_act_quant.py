@@ -28,15 +28,12 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from rl_engine.moe.mx_format import (
-    E4M3_MAX,
-    E8M0_BIAS,
-    EMAX_ELEM,
-    MX_BLOCK,
-    MXTensor,
+from rl_engine.kernels.ops.moe_common import (
+    finalize_act_quant,
     validate_act_quant_input,
     validate_ste_grad,
 )
+from rl_engine.moe.mx_format import E4M3_MAX, E8M0_BIAS, EMAX_ELEM, MX_BLOCK, MXTensor
 
 # Triton can only close over constexpr globals; values come from the contract.
 _TL_E4M3_MAX = tl.constexpr(E4M3_MAX)
@@ -76,13 +73,12 @@ def _mxfp8_act_quant_fwd_kernel(
     # |x| as a bit pattern: for non-negative floats the unsigned pattern is
     # monotone in the value, so amax is an integer max (no flush-to-zero).
     abs_bits = x.to(tl.uint32, bitcast=True) & _TL_ABS_MASK
-
-    # Fail-closed: report non-finite input through a device-side flag.
-    nonfinite = (abs_bits & _TL_EXP_MASK) == _TL_EXP_MASK
-    if tl.sum(nonfinite.to(tl.int32)) > 0:
-        tl.atomic_max(flag_ptr, 1)
-
     amax_bits = tl.max(abs_bits, axis=1)
+
+    # Fail-closed: inf/NaN patterns are >= 0x7F800000, so the tile's largest
+    # |x| pattern tells whether any element is non-finite.
+    if tl.max(amax_bits, axis=0) >= _TL_EXP_MASK:
+        tl.atomic_max(flag_ptr, 1)
 
     # floor(log2(amax)) from the exponent field (amax clamped to FLT_MIN first,
     # so the value is always normal and the field is exact).
@@ -117,8 +113,8 @@ def mxfp8_act_quant_fwd_triton(x: Tensor, check_finite: bool = True) -> MXTensor
     """BF16/FP16/FP32 ``[..., K]`` -> MXFP8 (E4M3 codes + block-32 E8M0 scales).
 
     ``check_finite`` reads back the kernel's fail-closed flag and therefore
-    costs one device sync per call; callers that batch the check (or measure
-    throughput) turn it off.
+    costs one device sync per call; it is only turned off for throughput
+    measurement (the providers always keep it on).
     """
     x = validate_act_quant_input(x, "triton")
     shape = tuple(x.shape)
@@ -153,9 +149,7 @@ def mxfp8_act_quant_fwd_triton(x: Tensor, check_finite: bool = True) -> MXTensor
         MX_BLOCK=MX_BLOCK,
         num_warps=num_warps,
     )
-    if check_finite and bool(flag.item()):
-        raise ValueError("non-finite values in mx_quantize input; P5 quantization is fail-closed")
-    return MXTensor(codes=codes, scales=scales, elem_format="e4m3", shape=shape)
+    return finalize_act_quant(codes, scales, flag, check_finite, shape)
 
 
 def mxfp8_act_quant_bwd_triton(dy: Tensor) -> Tensor:

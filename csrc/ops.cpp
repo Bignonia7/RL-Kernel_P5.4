@@ -364,17 +364,6 @@ std::vector<torch::Tensor> clamp_swiglu_weighted_packed_backward(
       p_s);
 }
 
-// MXFP8 activation quantization (P5-1)
-#if !defined(USE_ROCM)
-std::vector<torch::Tensor> mxfp8_act_quant_forward(torch::Tensor x, bool check_finite) {
-  return mxfp8_act_quant_forward_cuda(x, check_finite);
-}
-
-torch::Tensor mxfp8_act_quant_ste_backward(torch::Tensor dy) {
-  return mxfp8_act_quant_ste_backward_cuda(dy);
-}
-#endif
-
 // Deterministic standard-softmax attention (issue #147)
 std::vector<torch::Tensor> deterministic_attention_forward(
     torch::Tensor q,
@@ -633,11 +622,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // MXFP8 activation quantization (P5-1)
 #if !defined(USE_ROCM)
-    m.def("mxfp8_act_quant_forward", &mxfp8_act_quant_forward,
+    m.def("mxfp8_act_quant_forward", &mxfp8_act_quant_forward_cuda,
           "MXFP8 (E4M3 + block-32 E8M0) activation quantization; "
           "returns {codes, scales, nonfinite_flag}",
           py::arg("x"), py::arg("check_finite") = true);
-    m.def("mxfp8_act_quant_ste_backward", &mxfp8_act_quant_ste_backward,
+    m.def("mxfp8_act_quant_ste_backward", &mxfp8_act_quant_ste_backward_cuda,
           "Straight-through estimator backward for mxfp8_act_quant (dX = dY)");
 #endif
 

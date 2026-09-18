@@ -1,6 +1,6 @@
 # MXFP8 Activation Quantization (`mxfp8_act_quant`)
 
-DSv4 P5-1 (P5-1 spec). Quantizes routed-expert activations to **MXFP8** — OCP
+DSv4 P5-1. Quantizes routed-expert activations to **MXFP8** — OCP
 Microscaling E4M3 elements with one E8M0 shared scale per 32 elements — as the
 activation side of the MXFP8 × MXFP4 grouped GEMM (P5-4). Backward is a
 straight-through estimator.
