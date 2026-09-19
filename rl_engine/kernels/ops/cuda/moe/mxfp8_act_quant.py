@@ -19,6 +19,7 @@ the GPU CI sets — so it can never paper over a missing AOT symbol there.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import threading
 from typing import Any
@@ -26,7 +27,11 @@ from typing import Any
 import torch
 from torch import Tensor
 
-import envs
+try:
+    import envs
+except ImportError:  # installed wheel: the repo-root envs.py is not shipped
+    envs = None
+
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.kernels.ops.moe_common import (
     finalize_act_quant,
@@ -50,11 +55,16 @@ def _aot_available() -> bool:
 
 
 def _jit_load() -> Any:
-    if envs.env_flag(envs.RL_KERNEL_REQUIRE_EXT):
+    require_ext = (
+        envs.env_flag(envs.RL_KERNEL_REQUIRE_EXT)
+        if envs is not None
+        else os.environ.get("RL_KERNEL_REQUIRE_EXT") == "1"
+    )
+    if require_ext:
         raise RuntimeError(
             "CUDA mxfp8_act_quant requires the compiled rl_engine._C extension "
             "(rebuild with csrc/cuda/moe/mxfp8_act_quant.cu); the JIT fallback is "
-            f"disabled because {envs.RL_KERNEL_REQUIRE_EXT}=1."
+            "disabled because RL_KERNEL_REQUIRE_EXT=1."
         )
     if torch.version.hip is not None:
         raise RuntimeError(
