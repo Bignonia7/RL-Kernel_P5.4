@@ -345,7 +345,9 @@ def test_triton_offsets_do_not_wrap_past_int32():
     if free < need:
         pytest.skip(f"needs ~{need / 2**30:.1f} GiB free on the device, have {free / 2**30:.1f}")
     fwd = dict(FWD)["triton"]
-    x = (torch.randn(rows, cols, device=DEV) * 3.0).to(torch.bfloat16)
+    # Generate in bf16 directly: an fp32 randn followed by .to(bf16) would need
+    # an 8 GiB temporary on top of the 4 GiB input, blowing past the gate above.
+    x = torch.randn(rows, cols, device=DEV, dtype=torch.bfloat16) * 3.0
     full = fwd(x)
     for lo in (0, rows // 2, rows - 64):
         part = mx_quantize(x[lo : lo + 64], "e4m3")
