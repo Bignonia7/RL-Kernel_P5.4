@@ -115,6 +115,8 @@ void deterministic_collective_all_gather_fused(
 bool det_gemm_sm90_compiled();
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_fwd_rhs_transposed(torch::Tensor a, torch::Tensor bt);
+torch::Tensor det_gemm_fwd_out_fp32(torch::Tensor a, torch::Tensor b);
+torch::Tensor det_gemm_fwd_rhs_transposed_out_fp32(torch::Tensor a, torch::Tensor bt);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
 torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc);
@@ -130,6 +132,36 @@ torch::Tensor swiglu_packed_forward_cuda(torch::Tensor gate_up);
 std::vector<torch::Tensor> swiglu_packed_backward_cuda(
     torch::Tensor dy,
     torch::Tensor gate_up);
+// P5-2 ClampSwiGLU weighted declarations
+std::vector<torch::Tensor> clamp_swiglu_weighted_forward_cuda(
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::optional<torch::Tensor> p_s);
+
+// P5-5 (#64) Shared Expert MLP strict kernels (oracle-fp32-serial-v1)
+torch::Tensor p5_strict_gemm(torch::Tensor a, torch::Tensor b, bool trans_b);
+torch::Tensor p5_swiglu_shared_forward(torch::Tensor z);
+torch::Tensor p5_swiglu_shared_backward(torch::Tensor dh, torch::Tensor z);
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_backward_cuda(
+    torch::Tensor dh,
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::optional<torch::Tensor> p_s);
+  std::vector<torch::Tensor> clamp_swiglu_weighted_packed_forward_cuda(
+    torch::Tensor gate_up,
+    torch::optional<torch::Tensor> p_s);
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_packed_backward_cuda(
+    torch::Tensor dh,
+    torch::Tensor gate_up,
+    torch::optional<torch::Tensor> p_s);
+
+// MXFP8 activation quantization Declarations (P5-1)
+#if !defined(USE_ROCM)
+std::vector<torch::Tensor> mxfp8_act_quant_forward_cuda(torch::Tensor x, bool check_finite);
+torch::Tensor mxfp8_act_quant_ste_backward_cuda(torch::Tensor dy);
+#endif
 
 // RMSNorm Declarations & Wrappers
 
@@ -291,6 +323,45 @@ std::vector<torch::Tensor> swiglu_packed_backward(
     torch::Tensor dy,
     torch::Tensor gate_up) {
   return swiglu_packed_backward_cuda(dy, gate_up);
+}
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_forward(
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::optional<torch::Tensor> p_s) {
+  return clamp_swiglu_weighted_forward_cuda(
+      gate,
+      up,
+      p_s);
+}
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_backward(
+    torch::Tensor dh,
+    torch::Tensor gate,
+    torch::Tensor up,
+    torch::optional<torch::Tensor> p_s) {
+  return clamp_swiglu_weighted_backward_cuda(
+      dh,
+      gate,
+      up,
+      p_s);
+}
+std::vector<torch::Tensor> clamp_swiglu_weighted_packed_forward(
+    torch::Tensor gate_up,
+    torch::optional<torch::Tensor> p_s) {
+  return clamp_swiglu_weighted_packed_forward_cuda(
+      gate_up,
+      p_s);
+}
+
+std::vector<torch::Tensor> clamp_swiglu_weighted_packed_backward(
+    torch::Tensor dh,
+    torch::Tensor gate_up,
+    torch::optional<torch::Tensor> p_s) {
+  return clamp_swiglu_weighted_packed_backward_cuda(
+      dh,
+      gate_up,
+      p_s);
 }
 
 // Deterministic standard-softmax attention (issue #147)
@@ -476,6 +547,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "det_gemm_fwd_rhs_transposed",
         &det_gemm_fwd_rhs_transposed,
         "Batch-invariant deterministic GEMM with physical Bt[N,K] (C=A@Bt^T)");
+    m.def(
+        "det_gemm_fwd_out_fp32",
+        &det_gemm_fwd_out_fp32,
+        "det_gemm_fwd storing the FP32 accumulator (no final BF16 round)");
+    m.def(
+        "det_gemm_fwd_rhs_transposed_out_fp32",
+        &det_gemm_fwd_rhs_transposed_out_fp32,
+        "det_gemm_fwd_rhs_transposed storing the FP32 accumulator");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
     m.def(
@@ -502,6 +581,54 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Batch-invariant SwiGLU forward for [rows, 2 * intermediate]");
     m.def("swiglu_packed_backward", &swiglu_packed_backward,
           "Batch-invariant SwiGLU backward for [rows, 2 * intermediate]");
+    m.def(
+        "clamp_swiglu_weighted_forward",
+        &clamp_swiglu_weighted_forward,
+        py::arg("gate"),
+        py::arg("up"),
+        py::arg("p_s") = py::none(),
+        "P5 clamp_swiglu_weighted forward CUDA");
+
+    // P5-5 (#64) Shared Expert MLP strict kernels (oracle-fp32-serial-v1)
+    m.def("p5_strict_gemm", &p5_strict_gemm,
+          "Strict BF16-in/FP32-out GEMM, serial ascending-k, mul-then-add");
+    m.def("p5_swiglu_shared_forward", &p5_swiglu_shared_forward,
+          "One-round SwiGLU forward, shared-expert mode (p_s = None)");
+    m.def("p5_swiglu_shared_backward", &p5_swiglu_shared_backward,
+          "One-round SwiGLU backward, shared-expert mode (p_s = None)");
+
+    m.def(
+      "clamp_swiglu_weighted_backward",
+      &clamp_swiglu_weighted_backward,
+      py::arg("dh"),
+      py::arg("gate"),
+      py::arg("up"),
+      py::arg("p_s") = py::none(),
+      "P5 clamp_swiglu_weighted backward CUDA");
+    m.def(
+        "clamp_swiglu_weighted_packed_forward",
+        &clamp_swiglu_weighted_packed_forward,
+        py::arg("gate_up"),
+        py::arg("p_s") = py::none(),
+        "P5 packed clamp_swiglu_weighted forward CUDA");
+
+    m.def(
+        "clamp_swiglu_weighted_packed_backward",
+        &clamp_swiglu_weighted_packed_backward,
+        py::arg("dh"),
+        py::arg("gate_up"),
+        py::arg("p_s") = py::none(),
+        "P5 packed clamp_swiglu_weighted backward CUDA");
+
+    // MXFP8 activation quantization (P5-1)
+#if !defined(USE_ROCM)
+    m.def("mxfp8_act_quant_forward", &mxfp8_act_quant_forward_cuda,
+          "MXFP8 (E4M3 + block-32 E8M0) activation quantization; "
+          "returns {codes, scales, nonfinite_flag}",
+          py::arg("x"), py::arg("check_finite") = true);
+    m.def("mxfp8_act_quant_ste_backward", &mxfp8_act_quant_ste_backward_cuda,
+          "Straight-through estimator backward for mxfp8_act_quant (dX = dY)");
+#endif
 
     // Deterministic standard-softmax attention (issue #147)
     m.def(
